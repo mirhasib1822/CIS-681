@@ -1,0 +1,851 @@
+> # ============================================================
+> # CIS 681 — Discharge Communication Quality and HRRP Excess Readmission Ratio
+> # Full analysis pipeline — consolidated, clean version
+> # Last assembled: 2026-10-09
+> # See DECISIONS.md in this repo for the rationale behind each non-obvious choice below.
+> # ============================================================
+> 
+> library(readr); library(dplyr); library(stringr); library(readxl); library(tidyr)
+> library(sandwich); library(lmtest); library(lme4)
+> 
+> # ------------------------------------------------------------
+> # Step 0 — Load & zero-pad Facility IDs
+> # ------------------------------------------------------------
+> hcahps <- read_csv("HCAHPS-Hospital.csv", col_types = cols(`Facility ID` = col_character())) %>%
++   mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+Warning message:
+One or more parsing issues, call `problems()` on your data frame for details, e.g.:
+  dat <- vroom(...)
+  problems(dat) 
+> 
+> gen_info <- read_csv("Hospital_General_Information.csv", col_types = cols(`Facility ID` = col_character())) %>%
++   mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+Warning message:
+One or more parsing issues, call `problems()` on your data frame for details, e.g.:
+  dat <- vroom(...)
+  problems(dat) 
+> 
+> hrrp <- read_csv("FY_2026_Hospital_Readmissions_Reduction_Program_Hospital.csv",
++                  col_types = cols(`Facility ID` = col_character())) %>%
++   mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+>                                                                                          0s
+> ipps <- read_excel("FY 2024 IPPS Final Rule Impact File.xlsx", sheet = "FY 2024 Final", skip = 1,
++                    col_types = "text") %>%
++   rename(`Facility ID` = `Provider Number`)
+>                                                                                        
+> # ------------------------------------------------------------
+> # Step 1 — Spine from Hospital_General_Information
+> # ------------------------------------------------------------
+> spine <- gen_info %>%
++   filter(`Hospital Type` == "Acute Care Hospitals") %>%
++   select(`Facility ID`, `Facility Name`, State, `Hospital Type`, `Hospital Ownership`,
++          `Hospital overall rating`, `Hospital overall rating footnote`)
+> 
+> anyDuplicated(spine$`Facility ID`)  # should be 0
+[1] 0
+> 
+> # ------------------------------------------------------------
+> # Step 2 — HCAHPS reshape
+> # ------------------------------------------------------------
+> hcahps_wide <- hcahps %>%
++   filter(`HCAHPS Measure ID` %in% c(
++     "H_COMP_6_Y_P", "H_COMP_6_N_P", "H_COMP_6_STAR_RATING", "H_COMP_6_LINEAR_SCORE",
++     "H_COMP_7_SA", "H_COMP_7_A", "H_COMP_7_D_SD", "H_COMP_7_STAR_RATING", "H_COMP_7_LINEAR_SCORE"
++   )) %>%
++   mutate(`HCAHPS Answer Percent` = na_if(`HCAHPS Answer Percent`, "Not Applicable"),
++          `HCAHPS Answer Percent` = as.numeric(`HCAHPS Answer Percent`),
++          `HCAHPS Linear Mean Value` = na_if(`HCAHPS Linear Mean Value`, "Not Applicable"),
++          `HCAHPS Linear Mean Value` = as.numeric(`HCAHPS Linear Mean Value`),
++          value = coalesce(`HCAHPS Answer Percent`, `HCAHPS Linear Mean Value`)) %>%
++   select(`Facility ID`, `HCAHPS Measure ID`, value) %>%
++   pivot_wider(id_cols = `Facility ID`, names_from = `HCAHPS Measure ID`, values_from = value)
+Warning message:
+There were 2 warnings in `mutate()`.
+The first warning was:
+ℹ In argument: `HCAHPS Answer Percent = as.numeric(`HCAHPS Answer Percent`)`.
+Caused by warning:
+! NAs introduced by coercion
+ℹ Run dplyr::last_dplyr_warnings() to see the 1 remaining warning. 
+> 
+> hcahps_wide <- hcahps_wide %>%
++   mutate(
++     care_transition_primary   = H_COMP_7_LINEAR_SCORE,   # PRIMARY predictor
++     care_transition_topbox    = H_COMP_7_SA,              # ROBUSTNESS check (% "Strongly Agree")
++     discharge_info_linear     = H_COMP_6_LINEAR_SCORE      # used in Addition #3
++   )
+> 
+> # ------------------------------------------------------------
+> # Step 3 — HRRP reshape
+> # safe_weighted_mean() fixes a silent data-loss bug: weighted.mean(x, w, na.rm = TRUE)
+> # only drops rows where x is NA, not where w (Number of Discharges) is NA. CMS suppresses
+> # discharge counts while still reporting the ratio, so the default weighted.mean() silently
+> # nulled any hospital with one suppressed measure among its six. See DECISIONS.md #1.
+> # ------------------------------------------------------------
+> safe_weighted_mean <- function(x, w) {
++   ok <- !is.na(x) & !is.na(w)
++   if (!any(ok)) return(NA_real_)
++   weighted.mean(x[ok], w[ok])
++ }
+> 
+> hrrp_wide <- hrrp %>%
++   mutate(`Excess Readmission Ratio` = na_if(`Excess Readmission Ratio`, "N/A"),
++          `Excess Readmission Ratio` = as.numeric(`Excess Readmission Ratio`),
++          `Number of Discharges` = na_if(`Number of Discharges`, "N/A"),
++          `Number of Discharges` = as.numeric(`Number of Discharges`)) %>%
++   select(`Facility ID`, `Measure Name`, `Excess Readmission Ratio`, `Number of Discharges`) %>%
++   pivot_wider(id_cols = `Facility ID`,
++               names_from = `Measure Name`,
++               values_from = c(`Excess Readmission Ratio`, `Number of Discharges`))
+> 
+> err_cols  <- grep("^Excess Readmission Ratio_", names(hrrp_wide), value = TRUE)
+> disc_cols <- grep("^Number of Discharges_", names(hrrp_wide), value = TRUE)
+> 
+> hrrp_wide <- hrrp_wide %>%
++   rowwise() %>%
++   mutate(ERR_weighted = safe_weighted_mean(c_across(all_of(err_cols)), c_across(all_of(disc_cols)))) %>%
++   ungroup()
+> 
+> medical_pattern  <- "AMI|HF|COPD|PN"
+> surgical_pattern <- "CABG|HIP|KNEE"
+> 
+> medical_err_cols  <- grep(paste0("^Excess Readmission Ratio_.*(", medical_pattern, ")"),  names(hrrp_wide), value = TRUE)
+> surgical_err_cols <- grep(paste0("^Excess Readmission Ratio_.*(", surgical_pattern, ")"), names(hrrp_wide), value = TRUE)
+> medical_disc_cols  <- sub("Excess Readmission Ratio_", "Number of Discharges_", medical_err_cols)
+> surgical_disc_cols <- sub("Excess Readmission Ratio_", "Number of Discharges_", surgical_err_cols)
+> 
+> hrrp_wide <- hrrp_wide %>%
++   rowwise() %>%
++   mutate(
++     ERR_medical  = safe_weighted_mean(c_across(all_of(medical_err_cols)),  c_across(all_of(medical_disc_cols))),
++     ERR_surgical = safe_weighted_mean(c_across(all_of(surgical_err_cols)), c_across(all_of(surgical_disc_cols)))
++   ) %>%
++   ungroup()
+> 
+> hrrp_long <- hrrp_wide %>%
++   select(`Facility ID`, ERR_medical, ERR_surgical) %>%
++   pivot_longer(cols = c(ERR_medical, ERR_surgical), names_to = "condition_group", values_to = "ERR_group") %>%
++   mutate(condition_group = recode(condition_group, ERR_medical = "Medical", ERR_surgical = "Surgical"))
+> 
+> # ------------------------------------------------------------
+> # Step 4 — IPPS clean (confirmed column names: "Beds" not "BEDS", case-sensitive)
+> # ------------------------------------------------------------
+> ipps_clean <- ipps %>%
++   select(`Facility ID`, Beds, `Resident to Bed Ratio`, DSHPCT, `Ownership Control Type`) %>%
++   rename(BEDS = Beds) %>%
++   mutate(across(c(BEDS, `Resident to Bed Ratio`, DSHPCT), as.numeric),
++          log_beds = log(BEDS))
+> 
+> # ------------------------------------------------------------
+> # Step 5 — Merge
+> # ------------------------------------------------------------
+> n0 <- nrow(spine)
+> 
+> merged_wide <- spine %>%
++   left_join(ipps_clean, by = "Facility ID") %>%
++   left_join(hcahps_wide %>% select(`Facility ID`, care_transition_primary, care_transition_topbox, discharge_info_linear),
++             by = "Facility ID") %>%
++   left_join(hrrp_wide %>% select(`Facility ID`, ERR_weighted, ERR_medical, ERR_surgical), by = "Facility ID")
+> 
+> cat("Spine:", n0,
++     "| Missing IPPS match:", sum(is.na(merged_wide$BEDS)),
++     "| Missing Care Transition match:", sum(is.na(merged_wide$care_transition_primary)),
++     "| Missing HRRP composite match:", sum(is.na(merged_wide$ERR_weighted)), "\n")
+Spine: 3145 | Missing IPPS match: 53 | Missing Care Transition match: 444 | Missing HRRP composite match: 669 
+> 
+> merged_long <- merged_wide %>%
++   select(-ERR_weighted, -ERR_medical, -ERR_surgical) %>%
++   left_join(hrrp_long, by = "Facility ID")
+> 
+> # ------------------------------------------------------------
+> # Step 6 — Sanity checks
+> # ------------------------------------------------------------
+> hist(merged_wide$ERR_weighted, breaks = 40)
+> hist(merged_wide$ERR_medical, breaks = 40)
+> hist(merged_wide$ERR_surgical, breaks = 40)
+> hist(merged_wide$care_transition_primary, breaks = 40)
+> hist(merged_wide$DSHPCT, breaks = 40)
+> 
+> cor(merged_wide[, c("log_beds", "Resident to Bed Ratio", "DSHPCT")], use = "pairwise.complete.obs")
+                       log_beds Resident to Bed Ratio    DSHPCT
+log_beds              1.0000000             0.3737895 0.2815711
+Resident to Bed Ratio 0.3737895             1.0000000 0.2907787
+DSHPCT                0.2815711             0.2907787 1.0000000
+> car::vif(lm(ERR_weighted ~ log_beds + `Resident to Bed Ratio` + DSHPCT + `Hospital Ownership`, data = merged_wide))
+                            GVIF Df GVIF^(1/(2*Df))
+log_beds                1.272829  1        1.128197
+`Resident to Bed Ratio` 1.310958  1        1.144971
+DSHPCT                  1.208026  1        1.099102
+`Hospital Ownership`    1.141808  9        1.007395
+> 
+> merged_long %>% group_by(condition_group) %>% summarise(n_nonmissing = sum(!is.na(ERR_group)))
+# A tibble: 3 × 2
+  condition_group n_nonmissing
+  <chr>                  <int>
+1 Medical                 2444
+2 Surgical                 519
+3 NA                         0
+> 
+> # ------------------------------------------------------------
+> # Step 6b — Footnote / data-quality diagnostics (for the methods section)
+> # ------------------------------------------------------------
+> # HCAHPS: survey-completion reliability on the Care Transition measure
+> hcahps %>%
++   filter(`HCAHPS Measure ID` == "H_COMP_7_LINEAR_SCORE") %>%
++   count(`Number of Completed Surveys Footnote`)
+# A tibble: 17 × 2
+   `Number of Completed Surveys Footnote`     n
+   <chr>                                  <int>
+ 1 1                                        367
+ 2 10                                       324
+ 3 10, 11                                     7
+ 4 10, 29                                     5
+ 5 11                                        20
+ 6 19                                       165
+ 7 28                                         8
+ 8 29                                        58
+ 9 3                                          1
+10 3, 10                                      3
+11 3, 6                                       2
+12 5                                        291
+13 5, 24                                      4
+14 6                                        451
+15 6, 11                                      3
+16 6, 29                                      3
+17 NA                                      3079
+> 
+> # HRRP: suppression/exception reasons on the outcome side
+> hrrp %>% count(Footnote)
+# A tibble: 5 × 2
+  Footnote     n
+     <dbl> <int>
+1        1  3150
+2        5  3255
+3        7   205
+4       29   377
+5       NA 11343
+> 
+> # Confirm: hospitals flagged with low survey reliability (footnotes 6/10) are almost
+> # entirely outside the modeled sample already — predominantly Critical Access Hospitals
+> # (excluded from `spine`, and exempt from HRRP) or hospitals missing ERR/other covariates
+> # for the same low-volume reason. See DECISIONS.md for the full trace.
+> low_reliability_facilities <- hcahps %>%
++   filter(`HCAHPS Measure ID` == "H_COMP_7_LINEAR_SCORE",
++          `Number of Completed Surveys Footnote` %in% c("6", "10", "6, 11", "6, 29", "10, 11", "10, 29", "3, 10")) %>%
++   pull(`Facility ID`)
+> 
+> gen_info %>%
++   filter(`Facility ID` %in% low_reliability_facilities) %>%
++   count(`Hospital Type`, sort = TRUE)
+# A tibble: 4 × 2
+  `Hospital Type`                          n
+  <chr>                                <int>
+1 Critical Access Hospitals              562
+2 Acute Care Hospitals                   225
+3 Acute Care - Veterans Administration     5
+4 Acute Care - Department of Defense       4
+> 
+> # ------------------------------------------------------------
+> # Step 7a — Census Region crosswalk
+> # ------------------------------------------------------------
+> region_lookup <- tibble::tibble(
++   State = c("CT","ME","MA","NH","RI","VT","NJ","NY","PA",
++             "IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD",
++             "DE","FL","GA","MD","NC","SC","VA","DC","WV","AL","KY","MS","TN","AR","LA","OK","TX",
++             "AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA"),
++   Region = c(rep("Northeast", 9), rep("Midwest", 12), rep("South", 17), rep("West", 13))
++ )
+> 
+> merged_wide <- merged_wide %>% select(-any_of("Region")) %>% left_join(region_lookup, by = "State")
+> merged_long <- merged_long %>% select(-any_of("Region")) %>% left_join(region_lookup, by = "State")
+> 
+> # Confirm only the 5 known territory codes are unmatched — excluded by design (n=60, see DECISIONS.md)
+> merged_wide %>% filter(is.na(Region)) %>% count(State)
+# A tibble: 5 × 2
+  State     n
+  <chr> <int>
+1 AS        1
+2 GU        2
+3 MP        1
+4 PR       54
+5 VI        2
+> 
+> # ------------------------------------------------------------
+> # Step 7b — Build model datasets: collapse singleton Tribal category, relevel ownership, center predictors
+> # ------------------------------------------------------------
+> collapse_ownership <- function(x) {
++   dplyr::case_when(
++     x %in% c("Government - Federal", "Tribal") ~ "Government - Federal/Tribal",
++     TRUE ~ x
++   )
++ }
+> 
+> model_data_primary <- merged_wide %>%
++   filter(!is.na(ERR_weighted), !is.na(care_transition_primary), !is.na(log_beds),
++          !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT), !is.na(`Hospital Ownership`), !is.na(Region)) %>%
++   mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
++          `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
++          dshpct_c = DSHPCT - mean(DSHPCT, na.rm = TRUE),
++          care_transition_z = as.numeric(scale(care_transition_primary)),
++          log_beds_z = as.numeric(scale(log_beds)),
++          resident_ratio_z = as.numeric(scale(`Resident to Bed Ratio`)),
++          dshpct_z = as.numeric(scale(DSHPCT)))
+> 
+> model_data_long <- merged_long %>%
++   filter(!is.na(ERR_group), !is.na(care_transition_primary), !is.na(log_beds),
++          !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT), !is.na(`Hospital Ownership`), !is.na(Region)) %>%
++   mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
++          `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
++          care_transition_c = care_transition_primary - mean(care_transition_primary, na.rm = TRUE))
+> 
+> model_data_gap <- merged_wide %>%
++   filter(!is.na(ERR_weighted), !is.na(care_transition_primary), !is.na(discharge_info_linear),
++          !is.na(log_beds), !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT),
++          !is.na(`Hospital Ownership`), !is.na(Region)) %>%
++   mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
++          `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
++          care_transition_c2 = care_transition_primary - mean(care_transition_primary, na.rm = TRUE),
++          discharge_info_c   = discharge_info_linear - mean(discharge_info_linear, na.rm = TRUE))
+> 
+> model_data_primary %>% count(`Hospital Ownership`, sort = TRUE)  # Tribal should no longer appear on its own
+# A tibble: 9 × 2
+  `Hospital Ownership`                            n
+  <fct>                                       <int>
+1 Voluntary non-profit - Private               1230
+2 Proprietary                                   445
+3 Voluntary non-profit - Other                  222
+4 Voluntary non-profit - Church                 193
+5 Government - Hospital District or Authority   157
+6 Government - Local                            101
+7 Government - State                             33
+8 Physician                                      22
+9 Government - Federal/Tribal                     8
+> 
+> # Add immediately after Step 7b, before Step 7c — renames carry through to every model and table automatically
+> model_data_primary <- model_data_primary %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+> model_data_long <- model_data_long %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+> model_data_gap <- model_data_gap %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+> 
+> # ------------------------------------------------------------
+> # Step 7c — Primary model (H1)
+> # ------------------------------------------------------------
+> model_primary <- glm(ERR_weighted ~ care_transition_primary + log_beds + resident_bed_ratio +
++                        DSHPCT + `Hospital Ownership` + Region,
++                      family = Gamma(link = "log"), data = model_data_primary)
+> coeftest(model_primary, vcov = vcovCL(model_primary, cluster = model_data_primary$State))
+
+z test of coefficients:
+
+                                                                   Estimate  Std. Error
+(Intercept)                                                      0.43563608  0.05236568
+care_transition_primary                                         -0.00524733  0.00064638
+log_beds                                                        -0.00575639  0.00196849
+resident_bed_ratio                                              -0.01577428  0.00752145
+DSHPCT                                                           0.06422902  0.01206486
+`Hospital Ownership`Government - Federal/Tribal                  0.03715955  0.03456971
+`Hospital Ownership`Government - Hospital District or Authority  0.00579100  0.00521412
+`Hospital Ownership`Government - Local                           0.00727294  0.00680805
+`Hospital Ownership`Government - State                           0.00325317  0.00927409
+`Hospital Ownership`Physician                                   -0.10699424  0.04585506
+`Hospital Ownership`Proprietary                                  0.01074109  0.00485313
+`Hospital Ownership`Voluntary non-profit - Church               -0.00616693  0.00418821
+`Hospital Ownership`Voluntary non-profit - Other                 0.00089751  0.00454229
+RegionNortheast                                                  0.01107819  0.00691240
+RegionSouth                                                      0.00195134  0.00546267
+RegionWest                                                      -0.01933669  0.00827923
+                                                                z value  Pr(>|z|)    
+(Intercept)                                                      8.3191 < 2.2e-16 ***
+care_transition_primary                                         -8.1180 4.738e-16 ***
+log_beds                                                        -2.9243  0.003453 ** 
+resident_bed_ratio                                              -2.0972  0.035972 *  
+DSHPCT                                                           5.3236 1.017e-07 ***
+`Hospital Ownership`Government - Federal/Tribal                  1.0749  0.282412    
+`Hospital Ownership`Government - Hospital District or Authority  1.1106  0.266724    
+`Hospital Ownership`Government - Local                           1.0683  0.285392    
+`Hospital Ownership`Government - State                           0.3508  0.725753    
+`Hospital Ownership`Physician                                   -2.3333  0.019632 *  
+`Hospital Ownership`Proprietary                                  2.2132  0.026882 *  
+`Hospital Ownership`Voluntary non-profit - Church               -1.4725  0.140899    
+`Hospital Ownership`Voluntary non-profit - Other                 0.1976  0.843367    
+RegionNortheast                                                  1.6027  0.109011    
+RegionSouth                                                      0.3572  0.720931    
+RegionWest                                                      -2.3356  0.019514 *  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+> 
+> # ------------------------------------------------------------
+> # Step 7d — Multilevel robustness check
+> # ------------------------------------------------------------
+> model_primary_re <- glmer(ERR_weighted ~ care_transition_z + log_beds_z + resident_ratio_z +
++                             dshpct_z + `Hospital Ownership` + Region + (1 | State),
++                           family = Gamma(link = "log"), data = model_data_primary)
+Warning messages:
+1: In checkConv(attr(opt, "derivs"), opt$par, ctrl = control$checkConv,  :
+  Model failed to converge with max|grad| = 0.00546918 (tol = 0.002, component 1)
+2: In checkConv(attr(opt, "derivs"), opt$par, ctrl = control$checkConv,  :
+  Model is nearly unidentifiable: very large eigenvalue
+ - Rescale variables?
+> summary(model_primary_re)
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmerMod]
+ Family: Gamma  ( log )
+Formula: ERR_weighted ~ care_transition_z + log_beds_z + resident_ratio_z +  
+    dshpct_z + `Hospital Ownership` + Region + (1 | State)
+   Data: model_data_primary
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  -6754.7   -6650.5    3395.3   -6790.7      2393 
+
+Scaled residuals: 
+    Min      1Q  Median      3Q     Max 
+-7.0059 -0.5254 -0.0025  0.5595  8.3082 
+
+Random effects:
+ Groups   Name        Variance  Std.Dev.
+ State    (Intercept) 0.0001532 0.01238 
+ Residual             0.0034069 0.05837 
+Number of obs: 2411, groups:  State, 51
+
+Fixed effects:
+                                                                  Estimate Std. Error
+(Intercept)                                                     -0.0103640  0.0081906
+care_transition_z                                               -0.0137730  0.0014737
+log_beds_z                                                      -0.0059149  0.0013885
+resident_ratio_z                                                -0.0029285  0.0014750
+dshpct_z                                                         0.0081775  0.0016404
+`Hospital Ownership`Government - Federal/Tribal                  0.0340382  0.0210490
+`Hospital Ownership`Government - Hospital District or Authority  0.0034271  0.0052738
+`Hospital Ownership`Government - Local                           0.0089905  0.0063149
+`Hospital Ownership`Government - State                           0.0053787  0.0107694
+`Hospital Ownership`Physician                                   -0.1061873  0.0129284
+`Hospital Ownership`Proprietary                                  0.0079324  0.0035993
+`Hospital Ownership`Voluntary non-profit - Church               -0.0056084  0.0046400
+`Hospital Ownership`Voluntary non-profit - Other                -0.0006453  0.0043476
+RegionNortheast                                                  0.0157858  0.0122307
+RegionSouth                                                      0.0140678  0.0104895
+RegionWest                                                      -0.0198006  0.0110087
+                                                                t value Pr(>|z|)    
+(Intercept)                                                      -1.265   0.2057    
+care_transition_z                                                -9.346  < 2e-16 ***
+log_beds_z                                                       -4.260 2.05e-05 ***
+resident_ratio_z                                                 -1.985   0.0471 *  
+dshpct_z                                                          4.985 6.19e-07 ***
+`Hospital Ownership`Government - Federal/Tribal                   1.617   0.1059    
+`Hospital Ownership`Government - Hospital District or Authority   0.650   0.5158    
+`Hospital Ownership`Government - Local                            1.424   0.1545    
+`Hospital Ownership`Government - State                            0.499   0.6175    
+`Hospital Ownership`Physician                                    -8.214  < 2e-16 ***
+`Hospital Ownership`Proprietary                                   2.204   0.0275 *  
+`Hospital Ownership`Voluntary non-profit - Church                -1.209   0.2268    
+`Hospital Ownership`Voluntary non-profit - Other                 -0.148   0.8820    
+RegionNortheast                                                   1.291   0.1968    
+RegionSouth                                                       1.341   0.1799    
+RegionWest                                                       -1.799   0.0721 .  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Correlation matrix not shown by default, as p = 16 > 12.
+Use print(x, correlation=TRUE)  or
+    vcov(x)        if you need it
+optimizer (Nelder_Mead) convergence code: 0 (OK)
+Model failed to converge with max|grad| = 0.00546918 (tol = 0.002, component 1)
+Model is nearly unidentifiable: very large eigenvalue
+ - Rescale variables?
+
+> isSingular(model_primary_re)
+[1] FALSE
+> 
+> model_primary_re_bobyqa <- update(model_primary_re, control = glmerControl(optimizer = "bobyqa"))
+Warning message:
+In checkConv(attr(opt, "derivs"), opt$par, ctrl = control$checkConv,  :
+  Model is nearly unidentifiable: very large eigenvalue
+ - Rescale variables?
+> summary(model_primary_re_bobyqa)
+Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmerMod]
+ Family: Gamma  ( log )
+Formula: ERR_weighted ~ care_transition_z + log_beds_z + resident_ratio_z +  
+    dshpct_z + `Hospital Ownership` + Region + (1 | State)
+   Data: model_data_primary
+Control: glmerControl(optimizer = "bobyqa")
+
+      AIC       BIC    logLik -2*log(L)  df.resid 
+  -6754.7   -6650.5    3395.3   -6790.7      2393 
+
+Scaled residuals: 
+    Min      1Q  Median      3Q     Max 
+-7.0059 -0.5254 -0.0026  0.5595  8.3081 
+
+Random effects:
+ Groups   Name        Variance  Std.Dev.
+ State    (Intercept) 0.0001532 0.01238 
+ Residual             0.0034069 0.05837 
+Number of obs: 2411, groups:  State, 51
+
+Fixed effects:
+                                                                  Estimate Std. Error
+(Intercept)                                                     -0.0103850  0.0081927
+care_transition_z                                               -0.0137753  0.0014737
+log_beds_z                                                      -0.0059128  0.0013885
+resident_ratio_z                                                -0.0029293  0.0014750
+dshpct_z                                                         0.0081777  0.0016404
+`Hospital Ownership`Government - Federal/Tribal                  0.0340808  0.0210494
+`Hospital Ownership`Government - Hospital District or Authority  0.0034306  0.0052739
+`Hospital Ownership`Government - Local                           0.0089928  0.0063149
+`Hospital Ownership`Government - State                           0.0053765  0.0107694
+`Hospital Ownership`Physician                                   -0.1061697  0.0129284
+`Hospital Ownership`Proprietary                                  0.0079320  0.0035993
+`Hospital Ownership`Voluntary non-profit - Church               -0.0056093  0.0046400
+`Hospital Ownership`Voluntary non-profit - Other                -0.0006399  0.0043476
+RegionNortheast                                                  0.0157995  0.0122316
+RegionSouth                                                      0.0141017  0.0104915
+RegionWest                                                      -0.0197645  0.0110106
+                                                                t value Pr(>|z|)    
+(Intercept)                                                      -1.268   0.2049    
+care_transition_z                                                -9.347  < 2e-16 ***
+log_beds_z                                                       -4.258 2.06e-05 ***
+resident_ratio_z                                                 -1.986   0.0470 *  
+dshpct_z                                                          4.985 6.19e-07 ***
+`Hospital Ownership`Government - Federal/Tribal                   1.619   0.1054    
+`Hospital Ownership`Government - Hospital District or Authority   0.650   0.5154    
+`Hospital Ownership`Government - Local                            1.424   0.1544    
+`Hospital Ownership`Government - State                            0.499   0.6176    
+`Hospital Ownership`Physician                                    -8.212  < 2e-16 ***
+`Hospital Ownership`Proprietary                                   2.204   0.0275 *  
+`Hospital Ownership`Voluntary non-profit - Church                -1.209   0.2267    
+`Hospital Ownership`Voluntary non-profit - Other                 -0.147   0.8830    
+RegionNortheast                                                   1.292   0.1965    
+RegionSouth                                                       1.344   0.1789    
+RegionWest                                                       -1.795   0.0726 .  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Correlation matrix not shown by default, as p = 16 > 12.
+Use print(x, correlation=TRUE)  or
+    vcov(x)        if you need it
+optimizer (bobyqa) convergence code: 0 (OK)
+Model is nearly unidentifiable: very large eigenvalue
+ - Rescale variables?
+
+> 
+> # ------------------------------------------------------------
+> # Step 7e — Robustness: top-box predictor
+> # ------------------------------------------------------------
+> model_primary_topbox <- glm(ERR_weighted ~ care_transition_topbox + log_beds + resident_bed_ratio +
++                               DSHPCT + `Hospital Ownership` + Region,
++                             family = Gamma(link = "log"), data = model_data_primary)
+> coeftest(model_primary_topbox, vcov = vcovCL(model_primary_topbox, cluster = model_data_primary$State))
+
+z test of coefficients:
+
+                                                                   Estimate  Std. Error
+(Intercept)                                                      0.11887742  0.01874040
+care_transition_topbox                                          -0.00224549  0.00033484
+log_beds                                                        -0.00512420  0.00200654
+resident_bed_ratio                                              -0.01430388  0.00735807
+DSHPCT                                                           0.07103264  0.01240177
+`Hospital Ownership`Government - Federal/Tribal                  0.03592740  0.03504230
+`Hospital Ownership`Government - Hospital District or Authority  0.00578079  0.00550696
+`Hospital Ownership`Government - Local                           0.00656388  0.00681846
+`Hospital Ownership`Government - State                           0.00214181  0.00919296
+`Hospital Ownership`Physician                                   -0.10013844  0.04640667
+`Hospital Ownership`Proprietary                                  0.01391115  0.00484972
+`Hospital Ownership`Voluntary non-profit - Church               -0.00612344  0.00416295
+`Hospital Ownership`Voluntary non-profit - Other                 0.00131085  0.00458796
+RegionNortheast                                                  0.01178717  0.00711680
+RegionSouth                                                      0.00341833  0.00570542
+RegionWest                                                      -0.01821435  0.00866963
+                                                                z value  Pr(>|z|)    
+(Intercept)                                                      6.3434 2.248e-10 ***
+care_transition_topbox                                          -6.7061 1.999e-11 ***
+log_beds                                                        -2.5538  0.010657 *  
+resident_bed_ratio                                              -1.9440  0.051899 .  
+DSHPCT                                                           5.7276 1.018e-08 ***
+`Hospital Ownership`Government - Federal/Tribal                  1.0253  0.305242    
+`Hospital Ownership`Government - Hospital District or Authority  1.0497  0.293844    
+`Hospital Ownership`Government - Local                           0.9627  0.335717    
+`Hospital Ownership`Government - State                           0.2330  0.815774    
+`Hospital Ownership`Physician                                   -2.1578  0.030940 *  
+`Hospital Ownership`Proprietary                                  2.8684  0.004125 ** 
+`Hospital Ownership`Voluntary non-profit - Church               -1.4709  0.141308    
+`Hospital Ownership`Voluntary non-profit - Other                 0.2857  0.775097    
+RegionNortheast                                                  1.6562  0.097672 .  
+RegionSouth                                                      0.5991  0.549082    
+RegionWest                                                      -2.1009  0.035646 *  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+> 
+> # ------------------------------------------------------------
+> # Step 7f — Addition #1: condition-type moderation (Medical vs. Surgical)
+> # ------------------------------------------------------------
+> model_condition <- glm(ERR_group ~ care_transition_c * condition_group + log_beds +
++                          resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region,
++                        family = Gamma(link = "log"), data = model_data_long)
+> coeftest(model_condition, vcov = vcovCL(model_condition, cluster = model_data_long$`Facility ID`))
+
+z test of coefficients:
+
+                                                                   Estimate  Std. Error
+(Intercept)                                                      0.03607218  0.01097562
+care_transition_c                                               -0.00442800  0.00054485
+condition_groupSurgical                                          0.04612597  0.00686770
+log_beds                                                        -0.00940480  0.00213164
+resident_bed_ratio                                              -0.01503138  0.00885790
+DSHPCT                                                           0.05657137  0.01159767
+`Hospital Ownership`Government - Federal/Tribal                  0.01533474  0.04583507
+`Hospital Ownership`Government - Hospital District or Authority  0.00443166  0.00527748
+`Hospital Ownership`Government - Local                           0.00642806  0.00594401
+`Hospital Ownership`Government - State                           0.00443755  0.01344084
+`Hospital Ownership`Physician                                   -0.08231624  0.04169120
+`Hospital Ownership`Proprietary                                  0.01289083  0.00464285
+`Hospital Ownership`Voluntary non-profit - Church               -0.00593537  0.00570300
+`Hospital Ownership`Voluntary non-profit - Other                -0.00209219  0.00514525
+RegionNortheast                                                  0.01112932  0.00563083
+RegionSouth                                                      0.00229289  0.00416327
+RegionWest                                                      -0.01840422  0.00503207
+care_transition_c:condition_groupSurgical                       -0.01065165  0.00292059
+                                                                z value  Pr(>|z|)    
+(Intercept)                                                      3.2866 0.0010141 ** 
+care_transition_c                                               -8.1270 4.402e-16 ***
+condition_groupSurgical                                          6.7164 1.863e-11 ***
+log_beds                                                        -4.4120 1.024e-05 ***
+resident_bed_ratio                                              -1.6969 0.0897068 .  
+DSHPCT                                                           4.8778 1.073e-06 ***
+`Hospital Ownership`Government - Federal/Tribal                  0.3346 0.7379544    
+`Hospital Ownership`Government - Hospital District or Authority  0.8397 0.4010593    
+`Hospital Ownership`Government - Local                           1.0814 0.2795033    
+`Hospital Ownership`Government - State                           0.3302 0.7412836    
+`Hospital Ownership`Physician                                   -1.9744 0.0483332 *  
+`Hospital Ownership`Proprietary                                  2.7765 0.0054950 ** 
+`Hospital Ownership`Voluntary non-profit - Church               -1.0407 0.2979946    
+`Hospital Ownership`Voluntary non-profit - Other                -0.4066 0.6842831    
+RegionNortheast                                                  1.9765 0.0480987 *  
+RegionSouth                                                      0.5507 0.5818098    
+RegionWest                                                      -3.6574 0.0002548 ***
+care_transition_c:condition_groupSurgical                       -3.6471 0.0002652 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+> 
+> influence_check <- model_data_long %>% filter(condition_group == "Surgical")
+> plot(cooks.distance(glm(ERR_group ~ care_transition_primary + log_beds + resident_bed_ratio +
++                           DSHPCT + `Hospital Ownership` + Region,
++                         family = Gamma(link = "log"), data = influence_check)))
+> 
+> # ------------------------------------------------------------
+> # Step 7g — Addition #2: DSH/safety-net moderation
+> # ------------------------------------------------------------
+> model_dsh <- glm(ERR_weighted ~ care_transition_primary * dshpct_c + log_beds +
++                    resident_bed_ratio + `Hospital Ownership` + Region,
++                  family = Gamma(link = "log"), data = model_data_primary)
+> coeftest(model_dsh, vcov = vcovCL(model_dsh, cluster = model_data_primary$State))
+
+z test of coefficients:
+
+                                                                   Estimate  Std. Error
+(Intercept)                                                      0.47014510  0.06384890
+care_transition_primary                                         -0.00536040  0.00075629
+dshpct_c                                                        -0.47977738  0.26544087
+log_beds                                                        -0.00662561  0.00191583
+resident_bed_ratio                                              -0.01450485  0.00737753
+`Hospital Ownership`Government - Federal/Tribal                  0.03612770  0.03441674
+`Hospital Ownership`Government - Hospital District or Authority  0.00589669  0.00520041
+`Hospital Ownership`Government - Local                           0.00811310  0.00655446
+`Hospital Ownership`Government - State                           0.00254446  0.00914702
+`Hospital Ownership`Physician                                   -0.09595775  0.04528179
+`Hospital Ownership`Proprietary                                  0.01168442  0.00458284
+`Hospital Ownership`Voluntary non-profit - Church               -0.00636523  0.00413417
+`Hospital Ownership`Voluntary non-profit - Other                 0.00076442  0.00452620
+RegionNortheast                                                  0.01134502  0.00688992
+RegionSouth                                                      0.00104972  0.00550279
+RegionWest                                                      -0.01937888  0.00836269
+care_transition_primary:dshpct_c                                 0.00689242  0.00334345
+                                                                z value  Pr(>|z|)    
+(Intercept)                                                      7.3634 1.793e-13 ***
+care_transition_primary                                         -7.0878 1.363e-12 ***
+dshpct_c                                                        -1.8075 0.0706885 .  
+log_beds                                                        -3.4583 0.0005435 ***
+resident_bed_ratio                                              -1.9661 0.0492889 *  
+`Hospital Ownership`Government - Federal/Tribal                  1.0497 0.2938500    
+`Hospital Ownership`Government - Hospital District or Authority  1.1339 0.2568410    
+`Hospital Ownership`Government - Local                           1.2378 0.2157907    
+`Hospital Ownership`Government - State                           0.2782 0.7808788    
+`Hospital Ownership`Physician                                   -2.1191 0.0340799 *  
+`Hospital Ownership`Proprietary                                  2.5496 0.0107846 *  
+`Hospital Ownership`Voluntary non-profit - Church               -1.5397 0.1236430    
+`Hospital Ownership`Voluntary non-profit - Other                 0.1689 0.8658846    
+RegionNortheast                                                  1.6466 0.0996382 .  
+RegionSouth                                                      0.1908 0.8487121    
+RegionWest                                                      -2.3173 0.0204873 *  
+care_transition_primary:dshpct_c                                 2.0615 0.0392582 *  
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+> plot(cooks.distance(model_dsh))
+> 
+> # ------------------------------------------------------------
+> # Step 7h — Addition #3: comprehension-domain interaction (Care Transition x Discharge Information)
+> # ------------------------------------------------------------
+> cor(merged_wide$care_transition_primary, merged_wide$discharge_info_linear, use = "pairwise.complete.obs")
+[1] 0.7832755
+> 
+> model_gap <- glm(ERR_weighted ~ care_transition_c2 * discharge_info_c + log_beds +
++                    resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region,
++                  family = Gamma(link = "log"), data = model_data_gap)
+> coeftest(model_gap, vcov = vcovCL(model_gap, cluster = model_data_gap$State))
+
+z test of coefficients:
+
+                                                                   Estimate  Std. Error
+(Intercept)                                                      0.02400649  0.01006261
+care_transition_c2                                              -0.00355360  0.00102246
+discharge_info_c                                                -0.00210078  0.00062294
+log_beds                                                        -0.00688324  0.00198116
+resident_bed_ratio                                              -0.01496504  0.00754751
+DSHPCT                                                           0.06368835  0.01213059
+`Hospital Ownership`Government - Federal/Tribal                  0.03577066  0.03442158
+`Hospital Ownership`Government - Hospital District or Authority  0.00656948  0.00506506
+`Hospital Ownership`Government - Local                           0.00796512  0.00676802
+`Hospital Ownership`Government - State                           0.00285440  0.00934329
+`Hospital Ownership`Physician                                   -0.10146347  0.04714166
+`Hospital Ownership`Proprietary                                  0.01062249  0.00458663
+`Hospital Ownership`Voluntary non-profit - Church               -0.00662916  0.00415975
+`Hospital Ownership`Voluntary non-profit - Other                 0.00093528  0.00461734
+RegionNortheast                                                  0.01069911  0.00679108
+RegionSouth                                                     -0.00115497  0.00565978
+RegionWest                                                      -0.01982832  0.00819407
+care_transition_c2:discharge_info_c                             -0.00019383  0.00012759
+                                                                z value  Pr(>|z|)    
+(Intercept)                                                      2.3857 0.0170461 *  
+care_transition_c2                                              -3.4755 0.0005098 ***
+discharge_info_c                                                -3.3723 0.0007453 ***
+log_beds                                                        -3.4744 0.0005121 ***
+resident_bed_ratio                                              -1.9828 0.0473923 *  
+DSHPCT                                                           5.2502 1.519e-07 ***
+`Hospital Ownership`Government - Federal/Tribal                  1.0392 0.2987151    
+`Hospital Ownership`Government - Hospital District or Authority  1.2970 0.1946244    
+`Hospital Ownership`Government - Local                           1.1769 0.2392448    
+`Hospital Ownership`Government - State                           0.3055 0.7599837    
+`Hospital Ownership`Physician                                   -2.1523 0.0313730 *  
+`Hospital Ownership`Proprietary                                  2.3160 0.0205599 *  
+`Hospital Ownership`Voluntary non-profit - Church               -1.5936 0.1110160    
+`Hospital Ownership`Voluntary non-profit - Other                 0.2026 0.8394807    
+RegionNortheast                                                  1.5755 0.1151490    
+RegionSouth                                                     -0.2041 0.8383020    
+RegionWest                                                      -2.4198 0.0155275 *  
+care_transition_c2:discharge_info_c                             -1.5191 0.1287294    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+> 
+> car::vif(lm(ERR_weighted ~ care_transition_c2 + discharge_info_c + log_beds +
++               resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region, data = model_data_gap))
+                         GVIF Df GVIF^(1/(2*Df))
+care_transition_c2   2.983798  1        1.727367
+discharge_info_c     2.922839  1        1.709631
+log_beds             1.328747  1        1.152713
+resident_bed_ratio   1.467001  1        1.211198
+DSHPCT               1.633425  1        1.278055
+`Hospital Ownership` 1.478283  8        1.024731
+Region               1.534892  3        1.074021
+> 
+> # ------------------------------------------------------------
+> # Step 8 — Publication tables and figures
+> # ------------------------------------------------------------
+> # install.packages(c("modelsummary", "flextable", "ggeffects"), dependencies = TRUE)  # run once, then comment out
+> library(modelsummary)
+> library(ggeffects)
+> library(ggplot2)
+> 
+> coef_labels <- c(
++   "care_transition_primary" = "Care Transition (linear score)",
++   "care_transition_z" = "Care Transition (standardized)",
++   "care_transition_topbox" = "Care Transition (% top-box)",
++   "care_transition_c" = "Care Transition (centered)",
++   "care_transition_c2" = "Care Transition (centered)",
++   "discharge_info_c" = "Discharge Information (centered)",
++   "care_transition_c:condition_groupSurgical" = "Care Transition x Surgical",
++   "care_transition_primary:dshpct_c" = "Care Transition x DSH Share",
++   "care_transition_c2:discharge_info_c" = "Care Transition x Discharge Info",
++   "condition_groupSurgical" = "Condition Group: Surgical",
++   "dshpct_c" = "DSH Share (centered)",
++   "log_beds" = "Log(Beds)", "log_beds_z" = "Log(Beds), standardized",
++   "resident_bed_ratio" = "Resident-to-Bed Ratio",
++   "resident_ratio_z" = "Resident-to-Bed Ratio, standardized",
++   "DSHPCT" = "DSH Percentage", "dshpct_z" = "DSH Percentage, standardized"
++ )
+> 
+> ## Table 1: Descriptive statistics
+> # Replace log_beds with raw BEDS in the descriptive table — log_beds stays in the regression models, unchanged
+> datasummary(BEDS + ERR_weighted + ERR_medical + ERR_surgical + care_transition_primary +
++               discharge_info_linear + resident_bed_ratio + DSHPCT ~
++               Mean + SD + Min + Max + N,
++             data = model_data_primary, output = "Table1_Descriptives.docx")
+> 
+> # New — categorical breakdown, append right after
+> datasummary(`Hospital Ownership` + Region ~ N + Percent(),
++             data = model_data_primary,
++             output = "Table1b_CategoricalDescriptives.docx")
+> 
+> ## Table 2: Primary model (H1) — 3 specifications
+> models_primary <- list("Primary (GLM)" = model_primary,
++                        "Multilevel (GLMM)" = model_primary_re,
++                        "Top-box robustness" = model_primary_topbox)
+> vcov_primary <- list(vcovCL(model_primary, cluster = model_data_primary$State),
++                      vcov(model_primary_re),
++                      vcovCL(model_primary_topbox, cluster = model_data_primary$State))
+> 
+> modelsummary(models_primary, vcov = vcov_primary,
++              stars = c('*' = .05, '**' = .01, '***' = .001),
++              coef_rename = coef_labels, gof_omit = "IC|Log.Lik|RMSE",
++              notes = "Standard errors for the GLM specifications are clustered by state. The multilevel (GLMM) specification uses model-based standard errors.",
++              output = "Table2_PrimaryModel.docx")
+> 
+> ## Table 3: Moderation and extension models (Additions #1-3)
+> models_mod <- list("Condition-type (Add. 1)" = model_condition,
++                    "DSH-share (Add. 2)" = model_dsh,
++                    "Domain interaction (Add. 3)" = model_gap)
+> vcov_mod <- list(vcovCL(model_condition, cluster = model_data_long$`Facility ID`),
++                  vcovCL(model_dsh, cluster = model_data_primary$State),
++                  vcovCL(model_gap, cluster = model_data_gap$State))
+> 
+> modelsummary(models_mod, vcov = vcov_mod,
++              stars = c('*' = .05, '**' = .01, '***' = .001),
++              coef_rename = coef_labels, gof_omit = "IC|Log.Lik|RMSE",
++              notes = "Standard errors clustered by facility ID (Addition 1, two rows per hospital) or by state (Additions 2-3).",
++              output = "Table3_ModerationModels.docx")
+> 
+> ## Figure 1: Addition #1 — Care Transition x Condition Type
+> pred_condition <- ggpredict(model_condition, terms = c("care_transition_c [all]", "condition_group"),
++                             vcov.fun = "vcovCL", vcov.args = list(cluster = model_data_long$`Facility ID`))
+Some of the focal terms are of type `character`. This may lead to unexpected
+  results. It is recommended to convert these variables to factors before fitting
+  the model.
+  The following variables are of type character: `condition_group`
+Warning message:
+Looks like you are using syntactically invalid variable names, quoted in
+  backticks: `Hospital Ownership`. This may result in unexpected behaviour. Please
+  rename your variables (e.g., `Hospital.Ownership` instead of `Hospital Ownership`)
+  and fit the model again. 
+> plot(pred_condition) +
++   labs(title = "Predicted ERR by Care Transition Score and Condition Type",
++        x = "Care Transition Score (centered)", y = "Predicted ERR", color = "Condition Group") +
++   theme_minimal() + scale_color_viridis_d()
+Scale for colour is already present.
+Adding another scale for colour, which will replace the existing scale.
+> ggsave("Figure1_ConditionInteraction.png", width = 9, height = 5.5, dpi = 300)
+> 
+> ## Figure 2: Addition #2 — Care Transition x DSH Share
+> pred_dsh <- ggpredict(model_dsh, terms = c("care_transition_primary [all]", "dshpct_c [meansd]"),
++                       vcov.fun = "vcovCL", vcov.args = list(cluster = model_data_primary$State))
+Warning message:
+Looks like you are using syntactically invalid variable names, quoted in
+  backticks: `Hospital Ownership`. This may result in unexpected behaviour. Please
+  rename your variables (e.g., `Hospital.Ownership` instead of `Hospital Ownership`)
+  and fit the model again. 
+> plot(pred_dsh) +
++   labs(title = "Predicted ERR by Care Transition Score and DSH Share",
++        x = "Care Transition Score", y = "Predicted ERR", color = "DSH Share (centered, +/-1 SD)") +
++   theme_minimal() + scale_color_viridis_d()
+Scale for colour is already present.
+Adding another scale for colour, which will replace the existing scale.
+> ggsave("Figure2_DSHInteraction.png", width = 9, height = 5.5, dpi = 300)
