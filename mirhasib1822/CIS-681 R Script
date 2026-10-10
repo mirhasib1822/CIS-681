@@ -1,0 +1,386 @@
+# ============================================================
+# CIS 681 — Discharge Communication Quality and HRRP Excess Readmission Ratio
+# Full analysis pipeline — consolidated, clean version
+# Last assembled: 2026-10-09
+# See DECISIONS.md in this repo for the rationale behind each non-obvious choice below.
+# ============================================================
+
+library(readr); library(dplyr); library(stringr); library(readxl); library(tidyr)
+library(sandwich); library(lmtest); library(lme4)
+
+# ------------------------------------------------------------
+# Step 0 — Load & zero-pad Facility IDs
+# ------------------------------------------------------------
+hcahps <- read_csv("HCAHPS-Hospital.csv", col_types = cols(`Facility ID` = col_character())) %>%
+  mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+
+gen_info <- read_csv("Hospital_General_Information.csv", col_types = cols(`Facility ID` = col_character())) %>%
+  mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+
+hrrp <- read_csv("FY_2026_Hospital_Readmissions_Reduction_Program_Hospital.csv",
+                 col_types = cols(`Facility ID` = col_character())) %>%
+  mutate(`Facility ID` = str_pad(`Facility ID`, 6, pad = "0"))
+
+ipps <- read_excel("FY 2024 IPPS Final Rule Impact File.xlsx", sheet = "FY 2024 Final", skip = 1,
+                   col_types = "text") %>%
+  rename(`Facility ID` = `Provider Number`)
+
+# ------------------------------------------------------------
+# Step 1 — Spine from Hospital_General_Information
+# ------------------------------------------------------------
+spine <- gen_info %>%
+  filter(`Hospital Type` == "Acute Care Hospitals") %>%
+  select(`Facility ID`, `Facility Name`, State, `Hospital Type`, `Hospital Ownership`,
+         `Hospital overall rating`, `Hospital overall rating footnote`)
+
+anyDuplicated(spine$`Facility ID`)  # should be 0
+
+# ------------------------------------------------------------
+# Step 2 — HCAHPS reshape
+# ------------------------------------------------------------
+hcahps_wide <- hcahps %>%
+  filter(`HCAHPS Measure ID` %in% c(
+    "H_COMP_6_Y_P", "H_COMP_6_N_P", "H_COMP_6_STAR_RATING", "H_COMP_6_LINEAR_SCORE",
+    "H_COMP_7_SA", "H_COMP_7_A", "H_COMP_7_D_SD", "H_COMP_7_STAR_RATING", "H_COMP_7_LINEAR_SCORE"
+  )) %>%
+  mutate(`HCAHPS Answer Percent` = na_if(`HCAHPS Answer Percent`, "Not Applicable"),
+         `HCAHPS Answer Percent` = as.numeric(`HCAHPS Answer Percent`),
+         `HCAHPS Linear Mean Value` = na_if(`HCAHPS Linear Mean Value`, "Not Applicable"),
+         `HCAHPS Linear Mean Value` = as.numeric(`HCAHPS Linear Mean Value`),
+         value = coalesce(`HCAHPS Answer Percent`, `HCAHPS Linear Mean Value`)) %>%
+  select(`Facility ID`, `HCAHPS Measure ID`, value) %>%
+  pivot_wider(id_cols = `Facility ID`, names_from = `HCAHPS Measure ID`, values_from = value)
+
+hcahps_wide <- hcahps_wide %>%
+  mutate(
+    care_transition_primary   = H_COMP_7_LINEAR_SCORE,   # PRIMARY predictor
+    care_transition_topbox    = H_COMP_7_SA,              # ROBUSTNESS check (% "Strongly Agree")
+    discharge_info_linear     = H_COMP_6_LINEAR_SCORE      # used in Addition #3
+  )
+
+# ------------------------------------------------------------
+# Step 3 — HRRP reshape
+# safe_weighted_mean() fixes a silent data-loss bug: weighted.mean(x, w, na.rm = TRUE)
+# only drops rows where x is NA, not where w (Number of Discharges) is NA. CMS suppresses
+# discharge counts while still reporting the ratio, so the default weighted.mean() silently
+# nulled any hospital with one suppressed measure among its six. See DECISIONS.md #1.
+# ------------------------------------------------------------
+safe_weighted_mean <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w)
+  if (!any(ok)) return(NA_real_)
+  weighted.mean(x[ok], w[ok])
+}
+
+hrrp_wide <- hrrp %>%
+  mutate(`Excess Readmission Ratio` = na_if(`Excess Readmission Ratio`, "N/A"),
+         `Excess Readmission Ratio` = as.numeric(`Excess Readmission Ratio`),
+         `Number of Discharges` = na_if(`Number of Discharges`, "N/A"),
+         `Number of Discharges` = as.numeric(`Number of Discharges`)) %>%
+  select(`Facility ID`, `Measure Name`, `Excess Readmission Ratio`, `Number of Discharges`) %>%
+  pivot_wider(id_cols = `Facility ID`,
+              names_from = `Measure Name`,
+              values_from = c(`Excess Readmission Ratio`, `Number of Discharges`))
+
+err_cols  <- grep("^Excess Readmission Ratio_", names(hrrp_wide), value = TRUE)
+disc_cols <- grep("^Number of Discharges_", names(hrrp_wide), value = TRUE)
+
+hrrp_wide <- hrrp_wide %>%
+  rowwise() %>%
+  mutate(ERR_weighted = safe_weighted_mean(c_across(all_of(err_cols)), c_across(all_of(disc_cols)))) %>%
+  ungroup()
+
+medical_pattern  <- "AMI|HF|COPD|PN"
+surgical_pattern <- "CABG|HIP|KNEE"
+
+medical_err_cols  <- grep(paste0("^Excess Readmission Ratio_.*(", medical_pattern, ")"),  names(hrrp_wide), value = TRUE)
+surgical_err_cols <- grep(paste0("^Excess Readmission Ratio_.*(", surgical_pattern, ")"), names(hrrp_wide), value = TRUE)
+medical_disc_cols  <- sub("Excess Readmission Ratio_", "Number of Discharges_", medical_err_cols)
+surgical_disc_cols <- sub("Excess Readmission Ratio_", "Number of Discharges_", surgical_err_cols)
+
+hrrp_wide <- hrrp_wide %>%
+  rowwise() %>%
+  mutate(
+    ERR_medical  = safe_weighted_mean(c_across(all_of(medical_err_cols)),  c_across(all_of(medical_disc_cols))),
+    ERR_surgical = safe_weighted_mean(c_across(all_of(surgical_err_cols)), c_across(all_of(surgical_disc_cols)))
+  ) %>%
+  ungroup()
+
+hrrp_long <- hrrp_wide %>%
+  select(`Facility ID`, ERR_medical, ERR_surgical) %>%
+  pivot_longer(cols = c(ERR_medical, ERR_surgical), names_to = "condition_group", values_to = "ERR_group") %>%
+  mutate(condition_group = recode(condition_group, ERR_medical = "Medical", ERR_surgical = "Surgical"))
+
+# ------------------------------------------------------------
+# Step 4 — IPPS clean (confirmed column names: "Beds" not "BEDS", case-sensitive)
+# ------------------------------------------------------------
+ipps_clean <- ipps %>%
+  select(`Facility ID`, Beds, `Resident to Bed Ratio`, DSHPCT, `Ownership Control Type`) %>%
+  rename(BEDS = Beds) %>%
+  mutate(across(c(BEDS, `Resident to Bed Ratio`, DSHPCT), as.numeric),
+         log_beds = log(BEDS))
+
+# ------------------------------------------------------------
+# Step 5 — Merge
+# ------------------------------------------------------------
+n0 <- nrow(spine)
+
+merged_wide <- spine %>%
+  left_join(ipps_clean, by = "Facility ID") %>%
+  left_join(hcahps_wide %>% select(`Facility ID`, care_transition_primary, care_transition_topbox, discharge_info_linear),
+            by = "Facility ID") %>%
+  left_join(hrrp_wide %>% select(`Facility ID`, ERR_weighted, ERR_medical, ERR_surgical), by = "Facility ID")
+
+cat("Spine:", n0,
+    "| Missing IPPS match:", sum(is.na(merged_wide$BEDS)),
+    "| Missing Care Transition match:", sum(is.na(merged_wide$care_transition_primary)),
+    "| Missing HRRP composite match:", sum(is.na(merged_wide$ERR_weighted)), "\n")
+
+merged_long <- merged_wide %>%
+  select(-ERR_weighted, -ERR_medical, -ERR_surgical) %>%
+  left_join(hrrp_long, by = "Facility ID")
+
+# ------------------------------------------------------------
+# Step 6 — Sanity checks
+# ------------------------------------------------------------
+hist(merged_wide$ERR_weighted, breaks = 40)
+hist(merged_wide$ERR_medical, breaks = 40)
+hist(merged_wide$ERR_surgical, breaks = 40)
+hist(merged_wide$care_transition_primary, breaks = 40)
+hist(merged_wide$DSHPCT, breaks = 40)
+
+cor(merged_wide[, c("log_beds", "Resident to Bed Ratio", "DSHPCT")], use = "pairwise.complete.obs")
+car::vif(lm(ERR_weighted ~ log_beds + `Resident to Bed Ratio` + DSHPCT + `Hospital Ownership`, data = merged_wide))
+
+merged_long %>% group_by(condition_group) %>% summarise(n_nonmissing = sum(!is.na(ERR_group)))
+
+# ------------------------------------------------------------
+# Step 6b — Footnote / data-quality diagnostics (for the methods section)
+# ------------------------------------------------------------
+# HCAHPS: survey-completion reliability on the Care Transition measure
+hcahps %>%
+  filter(`HCAHPS Measure ID` == "H_COMP_7_LINEAR_SCORE") %>%
+  count(`Number of Completed Surveys Footnote`)
+
+# HRRP: suppression/exception reasons on the outcome side
+hrrp %>% count(Footnote)
+
+# Confirm: hospitals flagged with low survey reliability (footnotes 6/10) are almost
+# entirely outside the modeled sample already — predominantly Critical Access Hospitals
+# (excluded from `spine`, and exempt from HRRP) or hospitals missing ERR/other covariates
+# for the same low-volume reason. See DECISIONS.md for the full trace.
+low_reliability_facilities <- hcahps %>%
+  filter(`HCAHPS Measure ID` == "H_COMP_7_LINEAR_SCORE",
+         `Number of Completed Surveys Footnote` %in% c("6", "10", "6, 11", "6, 29", "10, 11", "10, 29", "3, 10")) %>%
+  pull(`Facility ID`)
+
+gen_info %>%
+  filter(`Facility ID` %in% low_reliability_facilities) %>%
+  count(`Hospital Type`, sort = TRUE)
+
+# ------------------------------------------------------------
+# Step 7a — Census Region crosswalk
+# ------------------------------------------------------------
+region_lookup <- tibble::tibble(
+  State = c("CT","ME","MA","NH","RI","VT","NJ","NY","PA",
+            "IL","IN","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD",
+            "DE","FL","GA","MD","NC","SC","VA","DC","WV","AL","KY","MS","TN","AR","LA","OK","TX",
+            "AZ","CO","ID","MT","NV","NM","UT","WY","AK","CA","HI","OR","WA"),
+  Region = c(rep("Northeast", 9), rep("Midwest", 12), rep("South", 17), rep("West", 13))
+)
+
+merged_wide <- merged_wide %>% select(-any_of("Region")) %>% left_join(region_lookup, by = "State")
+merged_long <- merged_long %>% select(-any_of("Region")) %>% left_join(region_lookup, by = "State")
+
+# Confirm only the 5 known territory codes are unmatched — excluded by design (n=60, see DECISIONS.md)
+merged_wide %>% filter(is.na(Region)) %>% count(State)
+
+# ------------------------------------------------------------
+# Step 7b — Build model datasets: collapse singleton Tribal category, relevel ownership, center predictors
+# ------------------------------------------------------------
+collapse_ownership <- function(x) {
+  dplyr::case_when(
+    x %in% c("Government - Federal", "Tribal") ~ "Government - Federal/Tribal",
+    TRUE ~ x
+  )
+}
+
+model_data_primary <- merged_wide %>%
+  filter(!is.na(ERR_weighted), !is.na(care_transition_primary), !is.na(log_beds),
+         !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT), !is.na(`Hospital Ownership`), !is.na(Region)) %>%
+  mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
+         `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
+         dshpct_c = DSHPCT - mean(DSHPCT, na.rm = TRUE),
+         care_transition_z = as.numeric(scale(care_transition_primary)),
+         log_beds_z = as.numeric(scale(log_beds)),
+         resident_ratio_z = as.numeric(scale(`Resident to Bed Ratio`)),
+         dshpct_z = as.numeric(scale(DSHPCT)))
+
+model_data_long <- merged_long %>%
+  filter(!is.na(ERR_group), !is.na(care_transition_primary), !is.na(log_beds),
+         !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT), !is.na(`Hospital Ownership`), !is.na(Region)) %>%
+  mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
+         `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
+         care_transition_c = care_transition_primary - mean(care_transition_primary, na.rm = TRUE))
+
+model_data_gap <- merged_wide %>%
+  filter(!is.na(ERR_weighted), !is.na(care_transition_primary), !is.na(discharge_info_linear),
+         !is.na(log_beds), !is.na(`Resident to Bed Ratio`), !is.na(DSHPCT),
+         !is.na(`Hospital Ownership`), !is.na(Region)) %>%
+  mutate(`Hospital Ownership` = collapse_ownership(`Hospital Ownership`),
+         `Hospital Ownership` = relevel(factor(`Hospital Ownership`), ref = "Voluntary non-profit - Private"),
+         care_transition_c2 = care_transition_primary - mean(care_transition_primary, na.rm = TRUE),
+         discharge_info_c   = discharge_info_linear - mean(discharge_info_linear, na.rm = TRUE))
+
+model_data_primary %>% count(`Hospital Ownership`, sort = TRUE)  # Tribal should no longer appear on its own
+
+# Add immediately after Step 7b, before Step 7c — renames carry through to every model and table automatically
+model_data_primary <- model_data_primary %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+model_data_long <- model_data_long %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+model_data_gap <- model_data_gap %>% rename(resident_bed_ratio = `Resident to Bed Ratio`)
+
+# ------------------------------------------------------------
+# Step 7c — Primary model (H1)
+# ------------------------------------------------------------
+model_primary <- glm(ERR_weighted ~ care_transition_primary + log_beds + resident_bed_ratio +
+                       DSHPCT + `Hospital Ownership` + Region,
+                     family = Gamma(link = "log"), data = model_data_primary)
+coeftest(model_primary, vcov = vcovCL(model_primary, cluster = model_data_primary$State))
+
+# ------------------------------------------------------------
+# Step 7d — Multilevel robustness check
+# ------------------------------------------------------------
+model_primary_re <- glmer(ERR_weighted ~ care_transition_z + log_beds_z + resident_ratio_z +
+                            dshpct_z + `Hospital Ownership` + Region + (1 | State),
+                          family = Gamma(link = "log"), data = model_data_primary)
+summary(model_primary_re)
+isSingular(model_primary_re)
+
+model_primary_re_bobyqa <- update(model_primary_re, control = glmerControl(optimizer = "bobyqa"))
+summary(model_primary_re_bobyqa)
+
+# ------------------------------------------------------------
+# Step 7e — Robustness: top-box predictor
+# ------------------------------------------------------------
+model_primary_topbox <- glm(ERR_weighted ~ care_transition_topbox + log_beds + resident_bed_ratio +
+                              DSHPCT + `Hospital Ownership` + Region,
+                            family = Gamma(link = "log"), data = model_data_primary)
+coeftest(model_primary_topbox, vcov = vcovCL(model_primary_topbox, cluster = model_data_primary$State))
+
+# ------------------------------------------------------------
+# Step 7f — Addition #1: condition-type moderation (Medical vs. Surgical)
+# ------------------------------------------------------------
+model_condition <- glm(ERR_group ~ care_transition_c * condition_group + log_beds +
+                         resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region,
+                       family = Gamma(link = "log"), data = model_data_long)
+coeftest(model_condition, vcov = vcovCL(model_condition, cluster = model_data_long$`Facility ID`))
+
+influence_check <- model_data_long %>% filter(condition_group == "Surgical")
+plot(cooks.distance(glm(ERR_group ~ care_transition_primary + log_beds + resident_bed_ratio +
+                          DSHPCT + `Hospital Ownership` + Region,
+                        family = Gamma(link = "log"), data = influence_check)))
+
+# ------------------------------------------------------------
+# Step 7g — Addition #2: DSH/safety-net moderation
+# ------------------------------------------------------------
+model_dsh <- glm(ERR_weighted ~ care_transition_primary * dshpct_c + log_beds +
+                   resident_bed_ratio + `Hospital Ownership` + Region,
+                 family = Gamma(link = "log"), data = model_data_primary)
+coeftest(model_dsh, vcov = vcovCL(model_dsh, cluster = model_data_primary$State))
+plot(cooks.distance(model_dsh))
+
+# ------------------------------------------------------------
+# Step 7h — Addition #3: comprehension-domain interaction (Care Transition x Discharge Information)
+# ------------------------------------------------------------
+cor(merged_wide$care_transition_primary, merged_wide$discharge_info_linear, use = "pairwise.complete.obs")
+
+model_gap <- glm(ERR_weighted ~ care_transition_c2 * discharge_info_c + log_beds +
+                   resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region,
+                 family = Gamma(link = "log"), data = model_data_gap)
+coeftest(model_gap, vcov = vcovCL(model_gap, cluster = model_data_gap$State))
+
+car::vif(lm(ERR_weighted ~ care_transition_c2 + discharge_info_c + log_beds +
+              resident_bed_ratio + DSHPCT + `Hospital Ownership` + Region, data = model_data_gap))
+
+# ------------------------------------------------------------
+# Step 8 — Publication tables and figures
+# ------------------------------------------------------------
+# install.packages(c("modelsummary", "flextable", "ggeffects"), dependencies = TRUE)  # run once, then comment out
+library(modelsummary)
+library(ggeffects)
+library(ggplot2)
+
+coef_labels <- c(
+  "care_transition_primary" = "Care Transition (linear score)",
+  "care_transition_z" = "Care Transition (standardized)",
+  "care_transition_topbox" = "Care Transition (% top-box)",
+  "care_transition_c" = "Care Transition (centered)",
+  "care_transition_c2" = "Care Transition (centered)",
+  "discharge_info_c" = "Discharge Information (centered)",
+  "care_transition_c:condition_groupSurgical" = "Care Transition x Surgical",
+  "care_transition_primary:dshpct_c" = "Care Transition x DSH Share",
+  "care_transition_c2:discharge_info_c" = "Care Transition x Discharge Info",
+  "condition_groupSurgical" = "Condition Group: Surgical",
+  "dshpct_c" = "DSH Share (centered)",
+  "log_beds" = "Log(Beds)", "log_beds_z" = "Log(Beds), standardized",
+  "resident_bed_ratio" = "Resident-to-Bed Ratio",
+  "resident_ratio_z" = "Resident-to-Bed Ratio, standardized",
+  "DSHPCT" = "DSH Percentage", "dshpct_z" = "DSH Percentage, standardized"
+)
+
+## Table 1: Descriptive statistics
+# Replace log_beds with raw BEDS in the descriptive table — log_beds stays in the regression models, unchanged
+datasummary(BEDS + ERR_weighted + ERR_medical + ERR_surgical + care_transition_primary +
+              discharge_info_linear + resident_bed_ratio + DSHPCT ~
+              Mean + SD + Min + Max + N,
+            data = model_data_primary, output = "Table1_Descriptives.docx")
+
+# New — categorical breakdown, append right after
+datasummary(`Hospital Ownership` + Region ~ N + Percent(),
+            data = model_data_primary,
+            output = "Table1b_CategoricalDescriptives.docx")
+
+## Table 2: Primary model (H1) — 3 specifications
+models_primary <- list("Primary (GLM)" = model_primary,
+                       "Multilevel (GLMM)" = model_primary_re,
+                       "Top-box robustness" = model_primary_topbox)
+vcov_primary <- list(vcovCL(model_primary, cluster = model_data_primary$State),
+                     vcov(model_primary_re),
+                     vcovCL(model_primary_topbox, cluster = model_data_primary$State))
+
+modelsummary(models_primary, vcov = vcov_primary,
+             stars = c('*' = .05, '**' = .01, '***' = .001),
+             coef_rename = coef_labels, gof_omit = "IC|Log.Lik|RMSE",
+             notes = "Standard errors for the GLM specifications are clustered by state. The multilevel (GLMM) specification uses model-based standard errors.",
+             output = "Table2_PrimaryModel.docx")
+
+## Table 3: Moderation and extension models (Additions #1-3)
+models_mod <- list("Condition-type (Add. 1)" = model_condition,
+                   "DSH-share (Add. 2)" = model_dsh,
+                   "Domain interaction (Add. 3)" = model_gap)
+vcov_mod <- list(vcovCL(model_condition, cluster = model_data_long$`Facility ID`),
+                 vcovCL(model_dsh, cluster = model_data_primary$State),
+                 vcovCL(model_gap, cluster = model_data_gap$State))
+
+modelsummary(models_mod, vcov = vcov_mod,
+             stars = c('*' = .05, '**' = .01, '***' = .001),
+             coef_rename = coef_labels, gof_omit = "IC|Log.Lik|RMSE",
+             notes = "Standard errors clustered by facility ID (Addition 1, two rows per hospital) or by state (Additions 2-3).",
+             output = "Table3_ModerationModels.docx")
+
+## Figure 1: Addition #1 — Care Transition x Condition Type
+pred_condition <- ggpredict(model_condition, terms = c("care_transition_c [all]", "condition_group"),
+                            vcov.fun = "vcovCL", vcov.args = list(cluster = model_data_long$`Facility ID`))
+plot(pred_condition) +
+  labs(title = "Predicted ERR by Care Transition Score and Condition Type",
+       x = "Care Transition Score (centered)", y = "Predicted ERR", color = "Condition Group") +
+  theme_minimal() + scale_color_viridis_d()
+ggsave("Figure1_ConditionInteraction.png", width = 9, height = 5.5, dpi = 300)
+
+## Figure 2: Addition #2 — Care Transition x DSH Share
+pred_dsh <- ggpredict(model_dsh, terms = c("care_transition_primary [all]", "dshpct_c [meansd]"),
+                      vcov.fun = "vcovCL", vcov.args = list(cluster = model_data_primary$State))
+plot(pred_dsh) +
+  labs(title = "Predicted ERR by Care Transition Score and DSH Share",
+       x = "Care Transition Score", y = "Predicted ERR", color = "DSH Share (centered, +/-1 SD)") +
+  theme_minimal() + scale_color_viridis_d()
+ggsave("Figure2_DSHInteraction.png", width = 9, height = 5.5, dpi = 300)
